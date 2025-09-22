@@ -1,6 +1,7 @@
 name: Build and Publish ShadowJar Pre-release
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]  # 当推送到 main 分支时触发
 
