@@ -80,6 +80,7 @@ class Session(
     private val bytesWrite = AtomicLong(0)
 
     private val runningUrl = Hashtable<String, UrlInfo>()
+    private val replacedUrl = Hashtable<String, Boolean>()
 
     @Serializable
     enum class ClientType {
@@ -96,7 +97,15 @@ class Session(
 
     fun status(): Status {
         synchronized(runningUrl) {
-            return Status(total.get(), success.get(), failed.get(), bytesWrite.get(), runningUrl.toMap())
+            return Status(total.get(), success.get(), failed.get(), bytesWrite.get(), runningUrl.toMap().mapKeys {
+                if (replacedUrl[it.key] == true){
+                    it.key.replace(regexCache) { result ->
+                        "${result.groupValues[1]}.doppiocdn.live"
+                    }
+                }else{
+                    it.key
+                }
+            })
         }
     }
 
@@ -106,7 +115,7 @@ class Session(
      */
     suspend fun testAndConfigure(): Boolean {
         try {
-            val get = ClientManager.getProxiedClient()
+            val get = ClientManager.getProxiedClient("room-test")
                 .get("https://zh.xhamsterlive.com/api/front/v1/broadcasts/${room.name}") {
                     this.expectSuccess = false
                 }
@@ -266,7 +275,7 @@ class Session(
                                     runningUrl[event.url()] = UrlInfo(ClientType.PROXY, System.currentTimeMillis())
                                 }
                                 withRetry(2) {
-                                    ClientManager.getProxiedClient().get(
+                                    ClientManager.getProxiedClient(room.name).get(
                                         event.url()
                                     ).readBytes().also {
                                         metric.successProxiedIncrement()
@@ -287,7 +296,12 @@ class Session(
                                 val created = (event.url().substringBeforeLast("_").substringAfterLast("_")
                                     .toLongOrDefault(0))
                                 val diff = System.currentTimeMillis() / 1000 - created
-                                logger.warn("Download segment:{} failed({}), delayed: {}s",index,(it as? ClientRequestException)?.response?.status?.value?:it.message,diff)
+                                logger.warn(
+                                    "Download segment:{} failed({}), delayed: {}s",
+                                    index,
+                                    (it as? ClientRequestException)?.response?.status?.value ?: it.message,
+                                    diff
+                                )
                             }
                         }
                     }
@@ -337,7 +351,7 @@ class Session(
                 ProcessorCtx(room, file.second, Date(), file.third, currentQuality)
             )
         }.onFailure {
-            logger.error("[{}] Postprocess failed",room.name,it)
+            logger.error("[{}] Postprocess failed", room.name, it)
         }
     }
 
@@ -361,13 +375,13 @@ class Session(
         var retry = 0
         var ms = System.currentTimeMillis()
         var startTime = ms
-        val regexCache = """media-hls\.doppiocdn\.\w+/(b-hls-\d+)""".toRegex()
+        var useRawCDN:Boolean? = false
         while (currentCoroutineContext().isActive) {
             retry++
             val url = streamUrl
             try {
                 val lines = withTimeout(5_000) {
-                    val rawList = (ClientManager.getProxiedClient()).get(
+                    val rawList = (ClientManager.getProxiedClient(room.name)).get(
                         url
                     ) {
                         parameter("psch", "v1")
@@ -389,11 +403,7 @@ class Session(
                         }
                     }
 
-                    newList.filterNot { it.contains("media.mp4") }.map {
-                        it.replace(regexCache) { it ->
-                            "${it.groupValues[1]}.doppiocdn.live"
-                        }
-                    }
+                    newList.filterNot { it.contains("media.mp4") }
                 }
 
                 metric?.updateRefreshLatency(System.currentTimeMillis() - ms)
@@ -406,11 +416,23 @@ class Session(
                 }
                 val videos = parseSegmentUrl(lines)
 
+                val replacedInitUrl = initUrlCur.replace(regexCache) { it ->
+                    "${it.groupValues[1]}.doppiocdn.live"
+                }
+                if (useRawCDN==null) try {
+                    ClientManager.getProxiedClient(room.name).get(replacedInitUrl).readBytes()
+                    useRawCDN=true
+                }catch (e: ClientRequestException) {
+                    useRawCDN=false
+                }catch (e: Exception){
+                    throw e
+                }
+                requireNotNull(useRawCDN) // stupid type infer
                 if (!started) {
                     started = true
-                    emit(Event.LiveSegmentInit(initUrlCur, room))
-                }
 
+                    emit(Event.LiveSegmentInit(if (useRawCDN)replacedInitUrl  else initUrlCur, room))
+                }
                 for (url in videos) {
                     // record time limit
                     if (System.currentTimeMillis() - startTime > room.limit.inWholeMilliseconds && !cache.contains(url) && url.endsWith(
@@ -427,7 +449,7 @@ class Session(
                                         ProcessorCtx(room, file.second, Date(), file.third, currentQuality)
                                     )
                                 }.onFailure {
-                                    logger.error("[{}] Postprocess failed",room.name,it)
+                                    logger.error("[{}] Postprocess failed", room.name, it)
                                 }
                             }
                         } catch (e: Exception) {
@@ -445,14 +467,16 @@ class Session(
                     // normal segments
                     if (currentCoroutineContext().isActive && !cache.contains(url)) {
                         cache.add(url)
-                        emit(Event.LiveSegmentData(url, initUrlCur, room))
+                        emit(Event.LiveSegmentData(if (useRawCDN)url.replace(regexCache) { it ->
+                            "${it.groupValues[1]}.doppiocdn.live"
+                        }else url, if (useRawCDN) replacedInitUrl  else initUrlCur, room))
                     }
                 }
                 retry = 0
             } catch (_: TimeoutCancellationException) {
                 logger.warn("[${room.name}] Refresh list timeout, trys=$retry")
                 if (!runCatching { testAndConfigure() }.getOrElse { false }) {
-                    logger.info("[STOP] [{}] Room off or non-public",room.name)
+                    logger.info("[STOP] [{}] Room off or non-public", room.name)
                     break
                 }
                 continue
@@ -525,15 +549,16 @@ class Session(
             throw IllegalArgumentException("Failed to parse init URL", e)
         }
     }
+    private val regexCache = """media-hls\.doppiocdn\.\w+/(b-hls-\d+)""".toRegex()
 
     private fun tryDownload(event: Event): Deferred<ByteArray?> = scope.async {
         val c = when (event) {
-            is Event.LiveSegmentData -> ClientManager.getClient()
-            is Event.LiveSegmentInit -> ClientManager.getProxiedClient()
+            is Event.LiveSegmentData -> ClientManager.getClient(room.name)
+            is Event.LiveSegmentInit -> ClientManager.getProxiedClient(room.name)
         }
         val created = (event.url().substringBeforeLast("_").substringAfterLast("_").toLongOrDefault(0))
         val diff = System.currentTimeMillis() / 1000 - created
-        val wait = (16L - diff) * 1000
+        val wait = (20L - diff) * 1000
         withTimeoutOrNull(if (wait > 0) wait else 0) {
             withRetry(25) { attempt ->
                 try {

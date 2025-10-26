@@ -7,27 +7,33 @@ import io.ktor.client.plugins.logging.*
 import io.ktor.client.request.*
 import io.ktor.http.*
 import okhttp3.ConnectionPool
+import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
 
 object ClientManager {
-    private val CONNECTION_POOL = ConnectionPool(64, 5, TimeUnit.MINUTES)
-    private val clientDirect by lazy {
-        HttpClient(OkHttp) {
+    private val logger = LoggerFactory.getLogger(ClientManager::class.java)
+    private fun clientDirect(key: String): HttpClient {
+        val pool = ConnectionPool(16, 5, TimeUnit.MINUTES)
+        logger.info("create direct client key={}", key)
+        return HttpClient(OkHttp) {
             configureClient()
             engine {
                 config {
-                    connectionPool(CONNECTION_POOL)
+                    connectionPool(pool)
                     followSslRedirects(true)
                     followRedirects(true)
                 }
             }
         }
     }
-    private val clientProxied by lazy {
+
+    private fun clientProxied(key: String): HttpClient {
+        val pool = ConnectionPool(16, 5, TimeUnit.MINUTES)
         val proxyEnv = System.getenv("http_proxy") ?: System.getenv("HTTP_PROXY")
-        HttpClient(OkHttp) {
+        logger.info("create proxied client key={} proxy={}", key, proxyEnv)
+        return HttpClient(OkHttp) {
             configureClient()
             install(Logging) {
                 logger = Logger.DEFAULT
@@ -39,7 +45,7 @@ object ClientManager {
                     proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(url.host, url.port))
                 }
                 config {
-                    connectionPool(CONNECTION_POOL)
+                    connectionPool(pool)
                     followSslRedirects(true)
                     followRedirects(true)
                 }
@@ -47,13 +53,9 @@ object ClientManager {
         }
     }
 
-    fun getClient(): HttpClient {
-        return clientDirect
-    }
-
-    fun getProxiedClient(): HttpClient {
-        return clientProxied
-    }
+    private val clientsProxied = HashMap<String, HttpClient>()
+    private val clientsDirect = HashMap<String, HttpClient>()
+    private val lock = Any()
 
     private fun HttpClientConfig<OkHttpConfig>.configureClient() {
         expectSuccess = true
@@ -73,9 +75,23 @@ object ClientManager {
         }
     }
 
+    fun getClient(key: String): HttpClient {
+        synchronized(lock) {
+            return clientsDirect[key] ?: clientDirect(key).also { clientsDirect[key] = it }
+        }
+    }
+
+    fun getProxiedClient(key: String): HttpClient {
+        synchronized(lock) {
+            return clientsProxied[key] ?: clientProxied(key).also { clientsProxied[key] = it }
+        }
+    }
     fun close() {
-        clientDirect.close()
-        clientProxied.close()
-        CONNECTION_POOL.evictAll()
+        clientsProxied.forEach {
+            it.value.close()
+        }
+        clientsDirect.forEach {
+            it.value.close()
+        }
     }
 }
